@@ -78,7 +78,8 @@ public enum ImpostorMode
     MONO_PARALLAX = 1,   // Impostor captured only from one perspective (left eye), reprojected into other views based on depth information
     STEREO = 2,          // Impostor is captured from two perspectives (left & right eye). Each impostor is rendered as a capture camera facing 2D quad.
     STEREO_PARALLAX = 3, // Impostor is captured from two perspectives (left & right eye), reprojected into other views based on depth information of current eye
-    AUTOMATIC = 4        // The Impostor-Manager can decide which impostor mode is currently appropriate
+    AUTOMATIC = 4,       // The Impostor-Manager can decide which impostor mode is currently appropriate
+    PREBAKED = 5         // Uses a pre-baked impostor prefab, no dynamic regeneration.
 }
 
 // ValidityField is used for the parallax term in the regeneration metric.

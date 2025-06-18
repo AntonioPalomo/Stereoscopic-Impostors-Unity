@@ -2,6 +2,10 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
+#if UNITY_EDITOR
+using UnityEditor;
+using System.IO;
+#endif
 
 // TODO: To support multi-material meshes, we have to operate on Unity's submesh granularity
 /// <summary>
@@ -11,6 +15,12 @@ using UnityEngine.Rendering;
 public class ImpostorGenerator : MonoBehaviour
 {
     public ImpostorMode impostorMode = ImpostorMode.AUTOMATIC;
+    public GameObject prebakedImpostorPrefab; // Field for the pre-baked prefab
+
+    // Default texture resolution for baking if not determined by screen projection
+    public int defaultBakeTextureWidth = 1024;
+    public int defaultBakeTextureHeight = 1024;
+
     public Camera viewerCamera; // If not set, Main Camera will be used
     private GameObject viewer;
     private float viewerIPD;
@@ -126,18 +136,78 @@ public class ImpostorGenerator : MonoBehaviour
     // Start is called before the first frame update
     void Start()
     {
-        // Try to register with global ImpostorManager
-        im = GameObject.FindObjectOfType<ImpostorManager>();
-        if (im == null)
+        if (Application.isPlaying)
         {
-            Debug.Log("Could not find an ImpostorManager in the scene. This component cannot function without an ImpostorManager...destroying component!");
-            Component.Destroy(this);
-            return;
+            im = GameObject.FindObjectOfType<ImpostorManager>();
+            if (im == null)
+            {
+                Debug.LogError("Runtime ImpostorManager not found. ImpostorGenerator cannot function.");
+                Component.Destroy(this);
+                return;
+            }
+
+            if (impostorMode == ImpostorMode.PREBAKED)
+            {
+                if (prebakedImpostorPrefab == null)
+                {
+                    Debug.LogError($"ImpostorGenerator on {gameObject.name} is in PREBAKED mode but no prebakedImpostorPrefab is assigned.", gameObject);
+                    Component.Destroy(this);
+                    return;
+                }
+
+                // Instantiate the prebaked prefab
+                generatedImpostor = Instantiate(prebakedImpostorPrefab, this.transform.position, this.transform.rotation, this.transform);
+                generatedImpostor.name = this.name + " - Prebaked Impostor";
+
+                // The prefab created by ImpostorBaker is already scaled to the object's bounds.
+                // Ensure its local transform is identity if it's parented to this GameObject.
+                generatedImpostor.transform.localPosition = Vector3.zero;
+                generatedImpostor.transform.localRotation = Quaternion.identity;
+                generatedImpostor.transform.localScale = Vector3.one;
+
+
+                MeshRenderer rend = generatedImpostor.GetComponentInChildren<MeshRenderer>(); // Get renderer from prefab child if any
+                if (rend != null)
+                {
+                    imPrimMat = rend.sharedMaterial; // Use its material
+                }
+                else
+                {
+                    Debug.LogError($"Prebaked impostor prefab for {gameObject.name} does not have a MeshRenderer.", gameObject);
+                    Component.Destroy(this);
+                    return;
+                }
+
+                // Basic initialization for PREBAKED mode
+                this.state = ImpostorState.IDLE;
+                 if (associatedMeshes == null || associatedMeshes.Count == 0)
+                {
+                    updateAssociatedMeshes(); // Still need this for switching to original mesh
+                }
+                // Ensure layerStorage is initialized for switchToOriginalMesh / switchToImpostor
+                this.layerStorage = new Dictionary<MeshFilter, int>();
+
+
+                // Hide the prebaked impostor initially, let ImpostorManager decide visibility
+                if (generatedImpostor != null)
+                     generatedImpostor.GetComponentInChildren<Renderer>().enabled = false;
+
+                im.registerImpostorGenerator(this);
+            }
+            else // Dynamic modes
+            {
+                // Try to register with global ImpostorManager
+                // (already found 'im' above)
+                initImpostorGenerator(); // Initializes runtime-specific data for dynamic impostors
+                im.registerImpostorGenerator(this);
+            }
         }
-        else
+        else // Editor mode
         {
-            initImpostorGenerator();
-            im.registerImpostorGenerator(this);
+            if (associatedMeshes == null || associatedMeshes.Count == 0)
+            {
+                updateAssociatedMeshes();
+            }
         }
     }
 
@@ -489,6 +559,12 @@ public class ImpostorGenerator : MonoBehaviour
     // Update is called once per frame
     void Update()
     {
+        if (!Application.isPlaying || impostorMode == ImpostorMode.PREBAKED)
+        {
+            // No blending or dynamic updates for prebaked impostors or in editor
+            return;
+        }
+
         if (this.state == ImpostorState.BLENDING)
         {
             if (this.blendingWeight > 0.99999f)
@@ -784,6 +860,12 @@ public class ImpostorGenerator : MonoBehaviour
     /// </summary>
     public bool generateNewImpostor(ImpostorMode nextImpostorMode)
     {
+        if (impostorMode == ImpostorMode.PREBAKED)
+        {
+            this.state = ImpostorState.IDLE; // Ensure it's idle
+            return false; // Prebaked impostors are not dynamically generated
+        }
+
         if (this.state != ImpostorState.IDLE)
             return false;
         this.state      = ImpostorState.GENERATING;
@@ -875,7 +957,232 @@ public class ImpostorGenerator : MonoBehaviour
 
     void onEnable()
     {
-        if (im != null)
-            im.registerImpostorGenerator(this);
+        if (Application.isPlaying)
+        {
+            if (im != null) // im might be null if Start hasn't run or failed
+                im.registerImpostorGenerator(this);
+        }
     }
+
+#if UNITY_EDITOR
+    public bool BakeImpostorInEditor(Camera bakingCamera, string savePath, int textureWidth, int textureHeight, string assetName)
+    {
+        if (bakingCamera == null)
+        {
+            Debug.LogError("Baking camera is null.");
+            return false;
+        }
+
+        if (associatedMeshes == null || associatedMeshes.Count == 0)
+        {
+            updateAssociatedMeshes();
+            if (associatedMeshes.Count == 0)
+            {
+                Debug.LogError("No associated meshes found for this ImpostorGenerator.");
+                return false;
+            }
+        }
+
+        // Ensure save directory exists
+        if (!Directory.Exists(savePath))
+        {
+            Directory.CreateDirectory(savePath);
+        }
+
+        // 1. Compute bounds and determine capture position/matrices
+        Bounds currentImpostorBounds = computeImpostorBounds(); // Ensure this is up-to-date
+
+        // For baking, we typically use a specific viewpoint or an array of viewpoints.
+        // Here, we'll adapt the runtime logic for a single mono capture.
+        // The bakingCamera is assumed to be positioned and oriented by the calling script (ImpostorBaker)
+        // to look at currentImpostorBounds.center.
+
+        // We need the view matrix from the baking camera
+        Matrix4x4 worldToCamMatrix = bakingCamera.worldToCameraMatrix;
+        // Unity uses OpenGL convention for projection matrices (negative Z forward for camera space)
+        // Camera.worldToCameraMatrix is already in this convention.
+        // For consistency with runtime, ensure Z is scaled if needed by shaders or matrix setup.
+        // The runtime computeViewMatrices scales Z by -1. Let's ensure our matrix is consistent.
+        Matrix4x4 captureViewMatrix = Matrix4x4.Scale(new Vector3(1, 1, -1)) * worldToCamMatrix;
+
+
+        // 2. Compute projection. For baking, we often want a tight projection.
+        // The runtime computeImpostorProjection and computeProjectionMatrix are complex due to atlas fitting and OIR.
+        // For editor baking, we can simplify: use the camera's current projection or define one.
+        // Let's use an orthographic projection for simplicity if the shader supports it,
+        // or a perspective one that tightly frames the bounds.
+        // For now, we will use the bakingCamera's projection matrix directly, assuming it's set up.
+        // Alternatively, calculate a tight perspective projection:
+        ProjectionResults projRes = computeImpostorProjection(currentImpostorBounds, captureViewMatrix, bakingCamera, Camera.MonoOrStereoscopicEye.Mono);
+        Matrix4x4 captureProjectionMatrix = computeProjectionMatrix(projRes, false); // false for useOIR, as we define texture size
+
+        // 3. Create RenderTextures for capture
+        RenderTexture radianceRT = new RenderTexture(textureWidth, textureHeight, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+        radianceRT.name = assetName + "_RadianceRT";
+        RenderTexture depthRT = new RenderTexture(textureWidth, textureHeight, 24, RenderTextureFormat.Depth, RenderTextureReadWrite.Linear); // Or RFloat for EXR
+        depthRT.name = assetName + "_DepthRT";
+        radianceRT.Create();
+        depthRT.Create();
+
+        // 4. Render the impostor
+        // Temporarily move meshes to the target layer for rendering if needed by camera culling mask
+        Dictionary<GameObject, int> originalLayers = new Dictionary<GameObject, int>();
+        int bakingLayer = bakingCamera.cullingMask == -1 ? 0 : Mathf.RoundToInt(Mathf.Log(bakingCamera.cullingMask.value, 2)); // Get single layer from mask
+
+        if (bakingLayer != 0) // Only if a specific layer is set for baking camera
+        {
+            foreach (MeshFilter mf in associatedMeshes)
+            {
+                if (mf != null && mf.gameObject != null)
+                {
+                    originalLayers[mf.gameObject] = mf.gameObject.layer;
+                    mf.gameObject.layer = bakingLayer;
+                }
+            }
+        }
+
+        bakingCamera.targetTexture = radianceRT; // Color and Depth can be separate or combined
+        // If ImpostorRegenerator feature is active and correctly copies depth, this might be enough.
+        // For direct manual depth rendering (if shader outputs depth to color buffer):
+        // bakingCamera.SetTargetBuffers(radianceRT.colorBuffer, depthRT.depthBuffer); // This is more typical
+
+        // Hack: To get depth into a texture from a shader that writes depth to SV_Depth,
+        // we might need the ImpostorRegenerator feature or a similar custom pass.
+        // For now, let's assume the main shader OR a temporary replacement shader can output depth to _CameraDepthTexture
+        // or that the URP's depth pass for the baking camera will populate depthRT.
+        // If the main "Unlit/RaymarchedImpostor" shader doesn't write depth itself, we rely on camera's depth texture.
+        // For simplicity, we'll assume the standard camera rendering populates the depth buffer.
+        bakingCamera.SetTargetBuffers(radianceRT.colorBuffer, depthRT.depthBuffer);
+
+        bakingCamera.Render();
+
+        // Restore original layers
+        if (bakingLayer != 0)
+        {
+            foreach (MeshFilter mf in associatedMeshes)
+            {
+                 if (mf != null && mf.gameObject != null && originalLayers.ContainsKey(mf.gameObject))
+                {
+                    mf.gameObject.layer = originalLayers[mf.gameObject];
+                }
+            }
+        }
+
+        // 5. Save textures
+        string radiancePath = Path.Combine(savePath, assetName + "_Radiance.png");
+        string depthPath = Path.Combine(savePath, assetName + "_Depth.exr"); // EXR for potentially HDR/linear depth
+
+        SaveRenderTexture(radianceRT, radiancePath, false);
+        SaveRenderTexture(depthRT, depthPath, true); // Save depth as linear EXR
+
+        RenderTexture.ReleaseTemporary(radianceRT);
+        RenderTexture.ReleaseTemporary(depthRT);
+        // Or if not temporary:
+        // radianceRT.Release(); DestroyImmediate(radianceRT);
+        // depthRT.Release(); DestroyImmediate(depthRT);
+
+
+        // 6. Create and configure material
+        Material bakedMaterial = new Material(Shader.Find("Unlit/RaymarchedImpostor")); // Use the runtime shader
+        if (bakedMaterial == null)
+        {
+            Debug.LogError("Could not find 'Unlit/RaymarchedImpostor' shader.");
+            return false;
+        }
+
+        Texture2D savedRadianceTex = AssetDatabase.LoadAssetAtPath<Texture2D>(radiancePath);
+        Texture2D savedDepthTex = AssetDatabase.LoadAssetAtPath<Texture2D>(depthPath);
+
+        if (savedRadianceTex == null || savedDepthTex == null)
+        {
+            Debug.LogError("Failed to load saved textures from AssetDatabase.");
+            return false;
+        }
+
+        // The runtime shader uses atlas coordinates. For baked textures, these are effectively (0,0,1,1)
+        Vector4 bakedAtlasCoords = new Vector4(0, 0, 1, 1);
+
+        bakedMaterial.SetTexture("_CurrentRadianceTex", savedRadianceTex);
+        bakedMaterial.SetTexture("_CurrentDepthTex", savedDepthTex);
+        // The shader likely uses _CaptureViewMat, _InvCaptureViewMat, _CaptureProjMat, _InvCaptureProjMat, _BboxMin, _BboxMax, _AtlasCoords
+        // For a baked impostor, view/projection matrices are relative to the bake.
+        // If the shader is designed for parallax, these matrices are crucial.
+        // We might need to store these on the material or a new component if they are fixed after baking.
+        // For a simple billboard, some of these might not be as critical.
+
+        // Store baked matrices (these are fixed at the moment of baking)
+        // For simplicity, we'll store the direct matrices. The shader might need inverses.
+        bakedMaterial.SetMatrix("_CaptureViewMat", captureViewMatrix);
+        bakedMaterial.SetMatrix("_InvCaptureViewMat", Matrix4x4.Inverse(captureViewMatrix));
+        bakedMaterial.SetMatrix("_CaptureProjMat", captureProjectionMatrix);
+        bakedMaterial.SetMatrix("_InvCaptureProjMat", Matrix4x4.Inverse(captureProjectionMatrix));
+
+        bakedMaterial.SetVector("_BboxMin", new Vector4(currentImpostorBounds.min.x, currentImpostorBounds.min.y, currentImpostorBounds.min.z, 0));
+        bakedMaterial.SetVector("_BboxMax", new Vector4(currentImpostorBounds.max.x, currentImpostorBounds.max.y, currentImpostorBounds.max.z, 0));
+        bakedMaterial.SetVectorArray("_AtlasCoords", new List<Vector4> { bakedAtlasCoords, bakedAtlasCoords }); // Assuming mono, fill both slots if shader expects array
+
+        // TODO: Handle ImpostorMode (MONO, STEREO etc.) for shader params if necessary
+        // For now, assume MONO_PARALLAX like behavior if depth is used.
+        bakedMaterial.SetInteger("_ImpostorMode", (int)ImpostorMode.MONO_PARALLAX);
+
+
+        string materialPath = Path.Combine(savePath, assetName + "_Material.mat");
+        AssetDatabase.CreateAsset(bakedMaterial, materialPath);
+        AssetDatabase.SaveAssets();
+        AssetDatabase.Refresh();
+
+        Debug.Log($"Impostor baked successfully for {name} at {savePath}");
+        return true;
+    }
+
+    private void SaveRenderTexture(RenderTexture rt, string path, bool isDepth)
+    {
+        RenderTexture previousActive = RenderTexture.active;
+        RenderTexture.active = rt;
+
+        Texture2D tex = new Texture2D(rt.width, rt.height, isDepth ? TextureFormat.RFloat : TextureFormat.RGBA32, false, !isDepth); // Linear for depth/data
+
+        tex.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
+        tex.Apply();
+
+        byte[] bytes;
+        if (isDepth)
+        {
+            // Ensure texture is RFloat for EXR. If it was captured as Depth format, this conversion is tricky.
+            // For true EXR depth, it's better to render to an RFloat or RHalf texture directly if possible.
+            // If rt.format is DepthFormat, ReadPixels reads it in a way that might not be directly EXR compatible as linear depth.
+            // This part might need refinement based on how depth is packed by ReadPixels from a DepthFormat RT.
+            // Simplification: Assume RFloat was used for depthRT or this conversion is okay.
+            bytes = tex.EncodeToEXR(Texture2D.EXRFlags.OutputAsFloat); // Requires RFloat or RGBAFloat usually
+        }
+        else
+        {
+            bytes = tex.EncodeToPNG();
+        }
+
+        File.WriteAllBytes(path, bytes);
+
+        RenderTexture.active = previousActive;
+        DestroyImmediate(tex); // Destroy temporary Texture2D
+
+        AssetDatabase.ImportAsset(path);
+        // Optionally set texture import settings if needed (e.g., linear for data textures)
+        TextureImporter importer = AssetImporter.GetAtPath(path) as TextureImporter;
+        if (importer != null)
+        {
+            if (isDepth)
+            {
+                importer.textureType = TextureImporterType.SingleChannel; // Or Default if it contains actual depth data for shader sampling
+                importer.sRGBTexture = false; // Linear
+                // Further settings for EXR might be here
+            }
+            else
+            {
+                 importer.sRGBTexture = true; // Color texture
+            }
+            importer.SaveAndReimport();
+        }
+    }
+
+#endif
 }

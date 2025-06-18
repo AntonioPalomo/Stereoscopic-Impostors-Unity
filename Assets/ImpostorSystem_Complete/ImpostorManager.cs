@@ -73,29 +73,23 @@ public class ImpostorManager : MonoBehaviour
 
     void doURPSettings()
     {
-        UniversalAdditionalCameraData addData = regenerationCamera.gameObject.AddComponent<UniversalAdditionalCameraData>();
-
-        ScriptableRendererData[] rendererDataList = (ScriptableRendererData[])typeof(UniversalRenderPipelineAsset).GetField("m_RendererDataList", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance).GetValue(UniversalRenderPipeline.asset);
-
-        bool foundImpostorRenderer = false;
-        for (int i = 0; i < rendererDataList.Length; i++)
+        // Ensure UniversalAdditionalCameraData exists for the runtime regeneration camera.
+        // It will use the default renderer from the active URP asset.
+        UniversalAdditionalCameraData addData = regenerationCamera.gameObject.GetComponent<UniversalAdditionalCameraData>();
+        if (addData == null)
         {
-            if (rendererDataList[i].name == "URP_Renderer_Impostors")
-            {
-                foundImpostorRenderer = true;
-                addData.SetRenderer(i);
-            }
+            addData = regenerationCamera.gameObject.AddComponent<UniversalAdditionalCameraData>();
         }
-        if(!foundImpostorRenderer)
-        {
-            Debug.LogError("Could not find the URP_Renderer_Impostors renderer in the current URP Asset");
-            Component.Destroy(this);
-        }
+        // No specific renderer is set on 'addData', so it will use the URP Asset's default.
+        Debug.Log("Runtime regenerationCamera configured to use default URP renderer.");
 
-        if(UniversalRenderPipeline.asset.useSRPBatcher)
+        // SRP Batcher setting was previously handled here by checking UniversalRenderPipeline.asset.useSRPBatcher.
+        // This check is still relevant if certain features depend on SRP Batcher being off.
+        // The actual disabling of SRP Batcher should be done in the URP Asset settings.
+        // The current URP_Asset.asset has m_UseSRPBatcher: 0, so it's already disabled.
+        if (UniversalRenderPipeline.asset != null && UniversalRenderPipeline.asset.useSRPBatcher)
         {
-            Debug.Log("Disabling SRP Batcher, as this breaks impostor regeneration!");
-            UniversalRenderPipeline.asset.useSRPBatcher = false;
+            Debug.LogWarning("SRP Batcher is enabled in the URP Asset. If impostor regeneration or rendering shows issues, consider disabling it in the URP Asset.");
         }
     }    
 
@@ -297,9 +291,24 @@ public class ImpostorManager : MonoBehaviour
         for (int i = 1; i <= Mathf.Min(COMPUTE_METRIC_PER_FRAME, impostorGenerators.Count); i++)
         {
             impostorID = (lastUpdatedImpostorIndex + i) % impostorGenerators.Count;
+            impostorID = (lastUpdatedImpostorIndex + i) % impostorGenerators.Count;
             ImpostorGenerator ig = impostorGenerators[impostorID];
             float priority = 0;
-            if (ig.getCurrentState() == ImpostorState.IDLE)
+
+            if (ig.impostorMode == ImpostorMode.PREBAKED)
+            {
+                // Prebaked impostors do not need dynamic regeneration or metric calculation
+                // However, they still need to be switched based on distance.
+                float distanceToObserver = Vector3.Distance(ig.getImpostorBounds().center, ig.viewerCamera.transform.position);
+                distanceToObserver -= Vector3.Magnitude(ig.getImpostorBounds().extents); // Approximate visible edge
+                if (distanceToObserver <= GLOBAL_IMPOSTOR_THRESHOLD_DISTANCE)
+                    ig.switchToOriginalMesh();
+                else
+                    ig.switchToImpostor();
+
+                priority = 0; // No regeneration priority
+            }
+            else if (ig.getCurrentState() == ImpostorState.IDLE) // Dynamic impostors
             {
                 // Compute distance to observer
                 float distanceToObserver = Vector3.Distance(ig.getImpostorBounds().center, ig.viewerCamera.transform.position);
@@ -391,6 +400,16 @@ public class ImpostorManager : MonoBehaviour
                 // The first candidate is always regenerated, even if the budget is insufficient
                 if ((budgetCounter >= budget) || (i == 0))
                 {
+                    // Skip regeneration for PREBAKED mode
+                    if (ig.impostorMode == ImpostorMode.PREBAKED)
+                    {
+                        // No regeneration needed, but we might count it as "processed" if it was the first item
+                        // This part of logic might need refinement if prebaked items significantly affect budgetting for dynamic ones.
+                        // For now, just ensure it doesn't try to regenerate.
+                        if (i == 0) budgetCounter -= budget; // Consume budget if it's the "must process" item.
+                        continue;
+                    }
+
                     ImpostorMode mode = determineImpostorMode(ig);
                     bool regeneration_scheduled = ig.generateNewImpostor(mode);
 
@@ -403,13 +422,19 @@ public class ImpostorManager : MonoBehaviour
             }
 
             // Perform the actual rendering step
-            regenerateImpostors(selectedCandidates);
+            if (selectedCandidates.Count > 0)
+                regenerateImpostors(selectedCandidates);
         }
     }
 
     private ImpostorMode determineImpostorMode(ImpostorGenerator ig)
     {
         ImpostorMode mode = ig.impostorMode;
+
+        if (mode == ImpostorMode.PREBAKED)
+        {
+            return ImpostorMode.PREBAKED; // Already determined, no dynamic change.
+        }
 
         // TODO: Include metric for switching between impostor modes
         if (mode == ImpostorMode.AUTOMATIC)
@@ -427,4 +452,40 @@ public class ImpostorManager : MonoBehaviour
         return mode;
     }
 
+    /// <summary>
+    /// Configures a camera with settings suitable for baking impostor textures.
+    /// This replicates settings from the runtime regenerationCamera setup.
+    /// </summary>
+    /// <param name="bakingCamera">The camera to configure.</param>
+    /// <param name="impostorRegenerationLayer">The layer containing objects to be rendered for the impostor.</param>
+    /// <param name="impostorRendererName">Optional name of the URP ScriptableRendererData to use for baking. If null, uses default.</param>
+    public static void SetupBakingCamera(Camera bakingCamera, int impostorRegenerationLayer, string impostorRendererName = "URP_Renderer_Impostors")
+    {
+        if (bakingCamera == null)
+        {
+            Debug.LogError("SetupBakingCamera: Provided camera is null.");
+            return;
+        }
+
+        bakingCamera.cullingMask = 1 << impostorRegenerationLayer;
+        bakingCamera.backgroundColor = new Color(0, 0, 0, 0);
+        bakingCamera.clearFlags = CameraClearFlags.Color | CameraClearFlags.Depth;
+        bakingCamera.renderingPath = RenderingPath.Forward;
+        bakingCamera.enabled = false; // Will be rendered manually
+        bakingCamera.forceIntoRenderTexture = true;
+        bakingCamera.depthTextureMode = DepthTextureMode.None; // Depth is typically handled by the impostor shader/render texture format
+        bakingCamera.allowMSAA = false;
+        bakingCamera.stereoTargetEye = StereoTargetEyeMask.None;
+
+        // Apply URP specific settings.
+        // Ensures UniversalAdditionalCameraData exists, but no longer sets a specific renderer.
+        // The camera will use the default renderer from the active URP asset.
+        UniversalAdditionalCameraData addData = bakingCamera.gameObject.GetComponent<UniversalAdditionalCameraData>();
+        if (addData == null)
+        {
+            addData = bakingCamera.gameObject.AddComponent<UniversalAdditionalCameraData>();
+        }
+        // No specific renderer is set on 'addData', so it will use the URP Asset's default.
+        Debug.Log("SetupBakingCamera: Configured to use default URP renderer.");
+    }
 }
